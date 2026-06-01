@@ -38,6 +38,10 @@ metal = ["whisper-rs-sys/metal", "_gpu"]
 vulkan = ["whisper-rs-sys/vulkan", "_gpu", "dep:libc"]
 openmp = ["whisper-rs-sys/openmp"]
 intel-sycl = ["whisper-rs-sys/intel-sycl", "_gpu"]
+# Share a single externally-built ggml with other inference stacks (e.g.
+# llama.cpp) instead of building whisper-rs-sys's bundled copy. The consumer
+# must provide a `ggml-sys` crate via `[patch.crates-io]`.
+system-ggml = ["whisper-rs-sys/system-ggml"]
 _gpu = []
 test-with-tiny-model = []
 

@@ -190,6 +190,51 @@ fn main() {
         .very_verbose(true)
         .pic(true);
 
+    if cfg!(feature = "system-ggml") {
+        // Share a single externally-built ggml with llama-cpp-sys-2 instead of
+        // building this crate's own bundled copy. `ggml-sys` (declared as an
+        // optional `[dependencies]` entry, activated by this feature) installs
+        // ggml under its own OUT_DIR and exports the path via
+        // `cargo:cmake_prefix_path=…`. Cargo surfaces that to this build script
+        // as `DEP_GGML_CMAKE_PREFIX_PATH`. Pointing CMAKE_PREFIX_PATH at it lets
+        // whisper.cpp's `find_package(ggml REQUIRED)` (triggered by
+        // WHISPER_USE_SYSTEM_GGML=ON) resolve against the shared build.
+        config.define("WHISPER_USE_SYSTEM_GGML", "ON");
+        let ggml_prefix = std::env::var("DEP_GGML_CMAKE_PREFIX_PATH").unwrap_or_else(|_| {
+            panic!(
+                "system-ggml feature is enabled but DEP_GGML_CMAKE_PREFIX_PATH is not set.\n\
+                 This means ggml-sys is not in the dependency graph. Did you forget to\n\
+                 enable the feature in the consuming workspace (e.g. via [patch.crates-io]\n\
+                 redirecting ggml-sys to a workspace-local crate)?"
+            )
+        });
+        config.define("CMAKE_PREFIX_PATH", &ggml_prefix);
+        println!("cargo:rerun-if-env-changed=DEP_GGML_INCLUDE");
+        println!("cargo:rerun-if-env-changed=DEP_GGML_CMAKE_PREFIX_PATH");
+        println!("cargo:rerun-if-env-changed=DEP_GGML_GGML_REV");
+
+        // Soft check for ggml SHA drift between the linked libggml and the headers
+        // bindgen reads from. Emits a `cargo:warning=` (not a panic) because
+        // ggml's exposed C API is API/ABI-stable across small drift windows —
+        // we still want to know if the gap grows.
+        let bundled_sync = std::path::Path::new("whisper.cpp/scripts/sync-ggml.last");
+        if let Ok(bundled_sha) = std::fs::read_to_string(bundled_sync) {
+            let bundled_sha = bundled_sha.trim();
+            if let Ok(expected_sha) = std::env::var("DEP_GGML_GGML_REV") {
+                if bundled_sha != expected_sha {
+                    println!(
+                        "cargo:warning=ggml SHA drift: ggml-sys is pinned at {expected_sha} but \
+                         this fork's bundled whisper.cpp/ggml synced from {bundled_sha}. The \
+                         linked libggml comes from ggml-sys's SHA, while bindgen reads bundled \
+                         headers. Safe only if ggml's C API is binary-compatible across this \
+                         range. Bump the whisper.cpp submodule to a commit whose \
+                         scripts/sync-ggml.last matches ggml-sys's pin to make this exact."
+                    );
+                }
+            }
+        }
+    }
+
     if cfg!(target_os = "windows") {
         config.cxxflag("/utf-8");
         println!("cargo:rustc-link-lib=advapi32");
@@ -303,21 +348,31 @@ fn main() {
     add_link_search_path(&out.join("build")).unwrap();
 
     println!("cargo:rustc-link-search=native={}", destination.display());
+
+    // When `system-ggml` is on, ggml-sys owns all ggml link directives — emit
+    // only the whisper-specific ones here. Doubling up would either fail at
+    // link time (duplicate symbols) or, worse, link two ggmls into one binary.
+    let link_ggml = !cfg!(feature = "system-ggml");
+
     if cfg!(feature = "intel-sycl") {
         println!("cargo:rustc-link-lib=whisper");
-        println!("cargo:rustc-link-lib=ggml");
-        println!("cargo:rustc-link-lib=ggml-base");
-        println!("cargo:rustc-link-lib=ggml-cpu");
+        if link_ggml {
+            println!("cargo:rustc-link-lib=ggml");
+            println!("cargo:rustc-link-lib=ggml-base");
+            println!("cargo:rustc-link-lib=ggml-cpu");
+        }
     } else {
         println!("cargo:rustc-link-lib=static=whisper");
-        println!("cargo:rustc-link-lib=static=ggml");
-        println!("cargo:rustc-link-lib=static=ggml-base");
-        println!("cargo:rustc-link-lib=static=ggml-cpu");
+        if link_ggml {
+            println!("cargo:rustc-link-lib=static=ggml");
+            println!("cargo:rustc-link-lib=static=ggml-base");
+            println!("cargo:rustc-link-lib=static=ggml-cpu");
+        }
     }
-    if cfg!(target_os = "macos") || cfg!(feature = "openblas") {
+    if link_ggml && (cfg!(target_os = "macos") || cfg!(feature = "openblas")) {
         println!("cargo:rustc-link-lib=static=ggml-blas");
     }
-    if cfg!(feature = "vulkan") {
+    if link_ggml && cfg!(feature = "vulkan") {
         if cfg!(feature = "intel-sycl") {
             println!("cargo:rustc-link-lib=ggml-vulkan");
         } else {
@@ -325,23 +380,23 @@ fn main() {
         }
     }
 
-    if cfg!(feature = "hipblas") {
+    if link_ggml && cfg!(feature = "hipblas") {
         println!("cargo:rustc-link-lib=static=ggml-hip");
     }
 
-    if cfg!(feature = "metal") {
+    if link_ggml && cfg!(feature = "metal") {
         println!("cargo:rustc-link-lib=static=ggml-metal");
     }
 
-    if cfg!(feature = "cuda") {
+    if link_ggml && cfg!(feature = "cuda") {
         println!("cargo:rustc-link-lib=static=ggml-cuda");
     }
 
-    if cfg!(feature = "openblas") {
+    if link_ggml && cfg!(feature = "openblas") {
         println!("cargo:rustc-link-lib=static=ggml-blas");
     }
 
-    if cfg!(feature = "intel-sycl") {
+    if link_ggml && cfg!(feature = "intel-sycl") {
         println!("cargo:rustc-link-lib=ggml-sycl");
     }
 

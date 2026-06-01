@@ -27,16 +27,29 @@ include = [
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[dependencies]
+# Optional shared-ggml backend, activated by the `system-ggml` feature.
+# When enabled, build.rs reads the install path from `DEP_GGML_CMAKE_PREFIX_PATH`
+# and passes it to CMake as `CMAKE_PREFIX_PATH`, so whisper.cpp's
+# `find_package(ggml REQUIRED)` (triggered by `WHISPER_USE_SYSTEM_GGML=ON`)
+# resolves against the externally-built ggml instead of the bundled copy.
+ggml-sys = { version = "*", optional = true }
+
 [features]
+# Backend selection. When `system-ggml` is also enabled, each backend feature
+# propagates into ggml-sys via `ggml-sys?/<backend>` (the `?` only activates
+# the feature if ggml-sys is already in the dep graph), so the externally-
+# built libggml has matching backend symbols.
 coreml = []
-cuda = []
-hipblas = []
+cuda = ["ggml-sys?/cuda"]
+hipblas = ["ggml-sys?/hipblas"]
 openblas = []
-metal = []
-vulkan = []
+metal = ["ggml-sys?/metal"]
+vulkan = ["ggml-sys?/vulkan"]
 force-debug = []
-openmp = []
+openmp = ["ggml-sys?/openmp"]
 intel-sycl = []
+system-ggml = ["dep:ggml-sys"]
 
 [build-dependencies]
 cmake = "0.1"
