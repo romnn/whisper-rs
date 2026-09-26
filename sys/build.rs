@@ -7,7 +7,7 @@ use cmake::Config;
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let target = env::var("TARGET").unwrap();
@@ -101,11 +101,29 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=wrapper.h");
+    // The version is declared here, so a submodule bump always changes this file.
+    println!("cargo:rerun-if-changed=whisper.cpp/CMakeLists.txt");
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let whisper_root = out.join("whisper.cpp");
 
-    if !whisper_root.exists() {
+    // The copy is reused across builds, so it is refreshed whenever the submodule moves;
+    // otherwise CMake would keep compiling the previous release while bindgen reads the new
+    // headers.
+    let source_stamp = whisper_source_stamp(Path::new("./whisper.cpp"));
+    let stamp_path = out.join("whisper.cpp.stamp");
+    let copy_is_current = whisper_root.exists()
+        && std::fs::read_to_string(&stamp_path).is_ok_and(|recorded| recorded == source_stamp);
+    if !copy_is_current {
+        if whisper_root.exists() {
+            std::fs::remove_dir_all(&whisper_root).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to clear stale whisper sources in {}: {}",
+                    whisper_root.display(),
+                    e
+                )
+            });
+        }
         std::fs::create_dir_all(&whisper_root).unwrap();
         fs_extra::dir::copy("./whisper.cpp", &out, &Default::default()).unwrap_or_else(|e| {
             panic!(
@@ -114,6 +132,8 @@ fn main() {
                 e
             )
         });
+        std::fs::write(&stamp_path, &source_stamp)
+            .unwrap_or_else(|e| panic!("Failed to write {}: {}", stamp_path.display(), e));
     }
 
     if env::var("WHISPER_DONT_GENERATE_BINDINGS").is_ok() {
@@ -465,4 +485,25 @@ fn get_whisper_cpp_version(whisper_root: &std::path::Path) -> std::io::Result<Op
         (Some(major), Some(minor), Some(patch)) => Some(format!("{major}.{minor}.{patch}")),
         _ => None,
     })
+}
+
+/// Identifies the whisper.cpp sources: the submodule commit in a git checkout, otherwise the
+/// contents of its `CMakeLists.txt`, which carries the release version.
+fn whisper_source_stamp(whisper_src: &Path) -> String {
+    // Without its own `.git`, `git rev-parse` would report an enclosing repository's commit.
+    if whisper_src.join(".git").exists() {
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(whisper_src)
+            .output()
+            .ok()
+            .filter(|output| output.status.success());
+        if let Some(output) = head {
+            return format!("commit {}", String::from_utf8_lossy(&output.stdout).trim());
+        }
+    }
+    let cmake_lists = whisper_src.join("CMakeLists.txt");
+    let contents = std::fs::read_to_string(&cmake_lists)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", cmake_lists.display(), e));
+    format!("cmake {contents}")
 }
