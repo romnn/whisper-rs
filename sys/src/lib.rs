@@ -1,6 +1,10 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(
+    unnecessary_transmutes,
+    reason = "bindgen reads the bitfields of glibc's `_IO_FILE` through `transmute`; other C libraries generate none"
+)]
 
 // Force ggml-sys into the linker graph when `system-ggml` is on. Without
 // this, downstream test binaries (e.g. `cargo test -p speech-to-text-whisper`)
