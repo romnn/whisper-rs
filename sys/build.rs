@@ -195,6 +195,9 @@ fn main() {
     }
 
     let mut config = Config::new(&whisper_root);
+    // Direct cache hits can reuse another checkout's incompatible ggml layouts.
+    // https://github.com/mozilla/sccache/issues/2863
+    config.env("SCCACHE_DIRECT", "false");
 
     config
         .profile("Release")
