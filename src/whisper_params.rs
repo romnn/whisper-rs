@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use whisper_rs_sys::whisper_token;
 
 /// The sampling strategy to use to pick tokens from a list of likely possibilities.
@@ -41,6 +41,12 @@ pub struct SegmentCallbackData {
 
 type SegmentCallbackFn = Box<dyn FnMut(SegmentCallbackData)>;
 
+/// The closure `set_abort_callback_safe` installs, owned by the params that point at it.
+///
+/// Clones of the params share it, and two of them can run at once on different threads, so
+/// calls go through the mutex.
+type AbortCallbackFn = Mutex<Box<dyn FnMut() -> bool + Send>>;
+
 #[derive(Clone)]
 pub struct FullParams<'a, 'b> {
     pub(crate) fp: whisper_rs_sys::whisper_full_params,
@@ -48,7 +54,7 @@ pub struct FullParams<'a, 'b> {
     phantom_tokens: PhantomData<&'b [c_int]>,
     grammar: Option<Vec<whisper_rs_sys::whisper_grammar_element>>,
     progress_callback_safe: Option<Arc<Box<dyn FnMut(i32)>>>,
-    abort_callback_safe: Option<Arc<Box<dyn FnMut() -> bool>>>,
+    abort_callback_safe: Option<Arc<AbortCallbackFn>>,
     segment_calllback_safe: Option<Arc<SegmentCallbackFn>>,
 }
 
@@ -614,37 +620,34 @@ impl<'a, 'b> FullParams<'a, 'b> {
     /// Note that, for safety, the callback only accepts a function that returns a boolean
     /// indicating whether to abort or not.
     ///
+    /// The params own the closure, and clones of them share it, so it lives exactly as long as
+    /// the last params that can call it.
+    ///
     /// See `set_progress_callback` if you need to use `whisper_context` and `whisper_state`,
     /// or extend this one to support their use.
     ///
     /// Defaults to None.
     pub fn set_abort_callback_safe<O, F>(&mut self, closure: O)
     where
-        F: FnMut() -> bool + 'static,
+        F: FnMut() -> bool + Send + 'static,
         O: Into<Option<F>>,
     {
         use std::ffi::c_void;
 
-        unsafe extern "C" fn trampoline<F>(user_data: *mut c_void) -> bool
-        where
-            F: FnMut() -> bool,
-        {
-            let user_data = &mut *(user_data as *mut F);
-            user_data()
+        unsafe extern "C" fn trampoline(user_data: *mut c_void) -> bool {
+            // SAFETY: `user_data` points at the `AbortCallbackFn` that `abort_callback_safe`
+            // keeps alive for as long as these params, or a clone of them, can run.
+            let callback = unsafe { &*(user_data as *const AbortCallbackFn) };
+            let mut callback = callback.lock().unwrap_or_else(PoisonError::into_inner);
+            callback()
         }
 
         match closure.into() {
             Some(closure) => {
-                // Stable address
-                let closure = Box::new(closure) as Box<dyn FnMut() -> bool>;
-                // Thin pointer
-                let closure = Box::new(closure);
-                // Raw pointer
-                let closure = Box::into_raw(closure);
-
-                self.fp.abort_callback = Some(trampoline::<F>);
-                self.fp.abort_callback_user_data = closure as *mut c_void;
-                self.abort_callback_safe = None;
+                let callback: Arc<AbortCallbackFn> = Arc::new(Mutex::new(Box::new(closure)));
+                self.fp.abort_callback = Some(trampoline);
+                self.fp.abort_callback_user_data = Arc::as_ptr(&callback) as *mut c_void;
+                self.abort_callback_safe = Some(callback);
             }
             None => {
                 self.fp.abort_callback = None;
@@ -956,5 +959,77 @@ mod test_whisper_params_initial_prompt {
             long_prompt.as_str(),
             "The initial prompt should match the long string provided."
         );
+    }
+}
+
+#[cfg(test)]
+mod test_whisper_params_abort_callback {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Calls the abort callback the way whisper.cpp does, through the raw function and user data.
+    fn call_abort_callback(params: &FullParams) -> bool {
+        let callback = params
+            .fp
+            .abort_callback
+            .expect("an abort callback is installed");
+        unsafe { callback(params.fp.abort_callback_user_data) }
+    }
+
+    #[test]
+    fn test_abort_callback_reaches_the_closure() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_abort_callback_safe({
+            let abort = Arc::clone(&abort);
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                abort.load(Ordering::Relaxed)
+            }
+        });
+
+        assert!(!call_abort_callback(&params));
+        abort.store(true, Ordering::Relaxed);
+        assert!(call_abort_callback(&params.clone()));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_abort_callback_is_dropped_with_the_last_params() {
+        let captured = Arc::new(());
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_abort_callback_safe({
+            let captured = Arc::clone(&captured);
+            move || Arc::strong_count(&captured) == 0
+        });
+        let clone = params.clone();
+
+        drop(params);
+        assert_eq!(
+            Arc::strong_count(&captured),
+            2,
+            "the clone still holds the closure"
+        );
+        assert!(!call_abort_callback(&clone));
+        drop(clone);
+        assert_eq!(Arc::strong_count(&captured), 1, "the closure was freed");
+    }
+
+    #[test]
+    fn test_abort_callback_replacement_frees_the_previous_closure() {
+        let captured = Arc::new(());
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_abort_callback_safe({
+            let captured = Arc::clone(&captured);
+            move || Arc::strong_count(&captured) == 0
+        });
+
+        params.set_abort_callback_safe::<_, fn() -> bool>(None);
+
+        assert_eq!(Arc::strong_count(&captured), 1);
+        assert!(params.fp.abort_callback.is_none());
+        assert!(params.fp.abort_callback_user_data.is_null());
     }
 }
