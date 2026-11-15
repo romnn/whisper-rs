@@ -169,11 +169,16 @@ where
 /// # Safety
 ///
 /// `ctx` must point at a live `FileLoader<F>` with no other active reference to it, and `output`
-/// must be valid for writes of `read_size` bytes.
+/// must be valid for writes of `read_size` bytes; it may be null when `read_size` is 0.
 unsafe extern "C" fn read<F>(ctx: *mut c_void, output: *mut c_void, read_size: usize) -> usize
 where
     F: FnMut(f32) + Send,
 {
+    // An empty request, such as for an empty vector whose `data()` is null, has nothing to fill,
+    // and Rust's pointer writes need a non-null pointer even for zero bytes.
+    if read_size == 0 {
+        return 0;
+    }
     // SAFETY: whisper.cpp passes back the `context` this loader was given, which points at the
     // `FileLoader<F>` that stays alive and otherwise untouched for the whole init call.
     let loader = unsafe { &mut *ctx.cast::<FileLoader<F>>() };
@@ -340,6 +345,28 @@ mod tests {
         let mut later = [0xAA; 8];
         assert_eq!(native_read(&raw, &mut later), 0);
         assert_eq!(later, [0; 8]);
+        assert!(matches!(
+            loader.error,
+            Some(WhisperError::ModelReadFailed(ErrorKind::UnexpectedEof))
+        ));
+    }
+
+    /// An empty request with a null buffer, as whisper.cpp makes for an empty vector, reads
+    /// nothing and changes nothing, even after a failure latched.
+    #[test]
+    fn empty_request_with_a_null_buffer_reads_nothing() {
+        let data = contents(16);
+        let file = TempFile::with_contents(&data);
+        let mut loader = FileLoader::open(&file.0, |_| {}).expect("open");
+        let raw = loader.raw();
+        let read = raw.read.expect("read callback");
+
+        let mut past_end = vec![0xAA; 32];
+        assert_eq!(native_read(&raw, &mut past_end), data.len());
+        // SAFETY: `raw.context` points at a loader the test keeps alive and does not otherwise
+        // access during the call, and a zero-byte request may pass a null buffer.
+        let read_back = unsafe { read(raw.context, std::ptr::null_mut(), 0) };
+        assert_eq!(read_back, 0);
         assert!(matches!(
             loader.error,
             Some(WhisperError::ModelReadFailed(ErrorKind::UnexpectedEof))
