@@ -38,6 +38,43 @@ impl WhisperContext {
         Ok(Self::wrap(ctx))
     }
 
+    /// Creates a new context from a model file, reporting how far the load has got.
+    ///
+    /// `on_progress` receives the fraction of the file's bytes consumed so far, in `0.0..=1.0`,
+    /// monotonically non-decreasing.
+    /// It runs on the calling thread, once per chunk read, so it should be cheap, such as an
+    /// atomic store.
+    ///
+    /// Not available with the `coreml` feature: CoreML finds its encoder through the model path
+    /// that only whisper.cpp's own file loading records.
+    ///
+    /// # Errors
+    ///
+    /// - [`WhisperError::ModelReadFailed`] when the file cannot be opened or read, with
+    ///   [`std::io::ErrorKind::UnexpectedEof`] when it is shorter than the model it describes.
+    /// - [`WhisperError::ProgressCallbackPanicked`] when `on_progress` panics; the panic is
+    ///   caught before it reaches whisper.cpp.
+    /// - [`WhisperError::InitError`] when whisper.cpp rejects the model for any other reason.
+    ///
+    /// # C++ equivalent
+    /// `struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_loader * loader, struct whisper_context_params params);`
+    #[cfg(not(feature = "coreml"))]
+    pub fn new_with_params_and_progress<P>(
+        path: P,
+        parameters: WhisperContextParameters,
+        on_progress: impl FnMut(f32) + Send,
+    ) -> Result<Self, WhisperError>
+    where
+        P: AsRef<Path>,
+    {
+        let ctx = WhisperInnerContext::new_with_params_and_progress(
+            path.as_ref(),
+            parameters,
+            on_progress,
+        )?;
+        Ok(Self::wrap(ctx))
+    }
+
     /// Create a new WhisperContext from a buffer.
     ///
     /// # Arguments

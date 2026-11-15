@@ -48,6 +48,13 @@ pub enum WhisperError {
     InputOutputLengthMismatch { input_len: usize, output_len: usize },
     /// Input slice was not an even number of samples.
     HalfSampleMissing(usize),
+    /// Opening or reading the model file failed.
+    ///
+    /// A file that ends before whisper.cpp has read everything it asks for, such as a truncated
+    /// download, reports [`std::io::ErrorKind::UnexpectedEof`].
+    ModelReadFailed(std::io::ErrorKind),
+    /// The model-load progress callback panicked, so the load was abandoned.
+    ProgressCallbackPanicked,
 }
 
 impl From<Utf8Error> for WhisperError {
@@ -134,6 +141,8 @@ impl std::fmt::Display for WhisperError {
                     size + 1
                 )
             }
+            ModelReadFailed(kind) => write!(f, "Failed to read the model file: {}.", kind),
+            ProgressCallbackPanicked => write!(f, "The model-load progress callback panicked."),
         }
     }
 }

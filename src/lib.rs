@@ -11,6 +11,8 @@ pub mod vulkan;
 
 mod common_logging;
 mod error;
+#[cfg(not(feature = "coreml"))]
+mod file_loader;
 mod ggml_logging_hook;
 mod standalone;
 mod utilities;

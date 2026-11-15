@@ -1,7 +1,6 @@
 // This example is not going to build in this folder.
 // You need to copy this code into your project and add the dependencies whisper_rs and hound in your cargo.toml
 
-use hound;
 use std::fs::File;
 use std::io::Write;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -87,7 +86,7 @@ fn main() -> Result<(), &'static str> {
         .into_samples::<i16>()
         .map(|x| x.expect("Invalid sample"))
         .collect();
-    let mut audio = vec![0.0f32; samples.len().try_into().unwrap()];
+    let mut audio = vec![0.0f32; samples.len()];
     whisper_rs::convert_integer_to_float_audio(&samples, &mut audio).expect("Conversion error");
 
     // Convert audio to 16KHz mono f32 samples, as required by the model.
