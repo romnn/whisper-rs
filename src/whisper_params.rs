@@ -39,12 +39,11 @@ pub struct SegmentCallbackData {
     pub text: String,
 }
 
-type SegmentCallbackFn = Box<dyn FnMut(SegmentCallbackData)>;
-
-/// The closure `set_abort_callback_safe` installs, owned by the params that point at it.
-///
-/// Clones of the params share it, and two of them can run at once on different threads, so
-/// calls go through the mutex.
+// The closures the safe callback setters install, each owned by the params whose raw callback
+// points at it. Clones of the params share it, and two of them can run at once on different
+// threads, so calls go through the mutex.
+type SegmentCallbackFn = Mutex<Box<dyn FnMut(SegmentCallbackData) + Send>>;
+type ProgressCallbackFn = Mutex<Box<dyn FnMut(i32) + Send>>;
 type AbortCallbackFn = Mutex<Box<dyn FnMut() -> bool + Send>>;
 
 #[derive(Clone)]
@@ -53,7 +52,7 @@ pub struct FullParams<'a, 'b> {
     phantom_lang: PhantomData<&'a str>,
     phantom_tokens: PhantomData<&'b [c_int]>,
     grammar: Option<Vec<whisper_rs_sys::whisper_grammar_element>>,
-    progress_callback_safe: Option<Arc<Box<dyn FnMut(i32)>>>,
+    progress_callback_safe: Option<Arc<ProgressCallbackFn>>,
     abort_callback_safe: Option<Arc<AbortCallbackFn>>,
     segment_calllback_safe: Option<Arc<SegmentCallbackFn>>,
 }
@@ -424,67 +423,36 @@ impl<'a, 'b> FullParams<'a, 'b> {
     /// See `set_new_segment_callback` if you need to use `whisper_context` and `whisper_state`
     /// **Warning** Can't be used with DTW. DTW will produce inconsistent callback invocation
     ///
+    /// A segment whose text is not valid UTF-8 is skipped.
+    /// The params own the closure, and clones of them share it, so it lives exactly as long as
+    /// the last params that can call it.
+    ///
     /// Defaults to None.
     pub fn set_segment_callback_safe<O, F>(&mut self, closure: O)
     where
-        F: FnMut(SegmentCallbackData) + 'static,
+        F: FnMut(SegmentCallbackData) + Send + 'static,
         O: Into<Option<F>>,
     {
-        use std::ffi::{c_void, CStr};
+        use std::ffi::c_void;
         use whisper_rs_sys::{whisper_context, whisper_state};
 
-        extern "C" fn trampoline<F>(
+        unsafe extern "C" fn trampoline(
             _: *mut whisper_context,
             state: *mut whisper_state,
-            n_new: i32,
+            n_new: c_int,
             user_data: *mut c_void,
-        ) where
-            F: FnMut(SegmentCallbackData) + 'static,
-        {
-            unsafe {
-                let user_data = &mut *(user_data as *mut SegmentCallbackFn);
-                let n_segments = whisper_rs_sys::whisper_full_n_segments_from_state(state);
-                let s0 = n_segments - n_new;
-                //let user_data = user_data as *mut Box<dyn FnMut(SegmentCallbackData)>;
-
-                for i in s0..n_segments {
-                    let text = whisper_rs_sys::whisper_full_get_segment_text_from_state(state, i);
-                    let text = CStr::from_ptr(text);
-
-                    let t0 = whisper_rs_sys::whisper_full_get_segment_t0_from_state(state, i);
-                    let t1 = whisper_rs_sys::whisper_full_get_segment_t1_from_state(state, i);
-
-                    if let Ok(n) = text.to_str() {
-                        user_data(SegmentCallbackData {
-                            segment: i,
-                            start_timestamp: t0,
-                            end_timestamp: t1,
-                            text: n.to_string(),
-                        })
-                    }
-                }
-            }
+        ) {
+            // SAFETY: whisper.cpp calls this with the state it decodes on and the user data the
+            // setter installed, which `segment_calllback_safe` keeps alive.
+            unsafe { deliver_new_segments(state, n_new, user_data, false) }
         }
 
-        match closure.into() {
-            Some(closure) => {
-                // Stable address
-                let closure = Box::new(closure) as SegmentCallbackFn;
-                // Thin pointer
-                let closure = Box::new(closure);
-                // Raw pointer
-                let closure = Box::into_raw(closure);
-
-                self.fp.new_segment_callback_user_data = closure as *mut c_void;
-                self.fp.new_segment_callback = Some(trampoline::<SegmentCallbackFn>);
-                self.segment_calllback_safe = None;
-            }
-            None => {
-                self.segment_calllback_safe = None;
-                self.fp.new_segment_callback = None;
-                self.fp.new_segment_callback_user_data = std::ptr::null_mut::<c_void>();
-            }
-        }
+        self.install_segment_callback(
+            closure
+                .into()
+                .map(|closure| Box::new(closure) as Box<dyn FnMut(SegmentCallbackData) + Send>),
+            trampoline,
+        );
     }
 
     /// Set the callback for segment updates.
@@ -493,62 +461,60 @@ impl<'a, 'b> FullParams<'a, 'b> {
     /// See `set_new_segment_callback` if you need to use `whisper_context` and `whisper_state`.
     /// **Warning** Can't be used with DTW. DTW will produce inconsistent callback invocation
     ///
+    /// The params own the closure, and clones of them share it, so it lives exactly as long as
+    /// the last params that can call it.
+    ///
     /// Defaults to None.
     pub fn set_segment_callback_safe_lossy<O, F>(&mut self, closure: O)
     where
-        F: FnMut(SegmentCallbackData) + 'static,
+        F: FnMut(SegmentCallbackData) + Send + 'static,
         O: Into<Option<F>>,
     {
-        use std::ffi::{c_void, CStr};
+        use std::ffi::c_void;
         use whisper_rs_sys::{whisper_context, whisper_state};
 
-        extern "C" fn trampoline<F>(
+        unsafe extern "C" fn trampoline(
             _: *mut whisper_context,
             state: *mut whisper_state,
-            n_new: i32,
+            n_new: c_int,
             user_data: *mut c_void,
-        ) where
-            F: FnMut(SegmentCallbackData) + 'static,
-        {
-            unsafe {
-                let user_data = &mut *(user_data as *mut SegmentCallbackFn);
-                let n_segments = whisper_rs_sys::whisper_full_n_segments_from_state(state);
-                let s0 = n_segments - n_new;
-                //let user_data = user_data as *mut Box<dyn FnMut(SegmentCallbackData)>;
-
-                for i in s0..n_segments {
-                    let text = whisper_rs_sys::whisper_full_get_segment_text_from_state(state, i);
-                    let text = CStr::from_ptr(text);
-
-                    let t0 = whisper_rs_sys::whisper_full_get_segment_t0_from_state(state, i);
-                    let t1 = whisper_rs_sys::whisper_full_get_segment_t1_from_state(state, i);
-                    user_data(SegmentCallbackData {
-                        segment: i,
-                        start_timestamp: t0,
-                        end_timestamp: t1,
-                        text: text.to_string_lossy().to_string(),
-                    });
-                }
-            }
+        ) {
+            // SAFETY: whisper.cpp calls this with the state it decodes on and the user data the
+            // setter installed, which `segment_calllback_safe` keeps alive.
+            unsafe { deliver_new_segments(state, n_new, user_data, true) }
         }
 
-        match closure.into() {
-            Some(closure) => {
-                // Stable address
-                let closure = Box::new(closure) as SegmentCallbackFn;
-                // Thin pointer
-                let closure = Box::new(closure);
-                // Raw pointer
-                let closure = Box::into_raw(closure);
+        self.install_segment_callback(
+            closure
+                .into()
+                .map(|closure| Box::new(closure) as Box<dyn FnMut(SegmentCallbackData) + Send>),
+            trampoline,
+        );
+    }
 
-                self.fp.new_segment_callback_user_data = closure as *mut c_void;
-                self.fp.new_segment_callback = Some(trampoline::<SegmentCallbackFn>);
-                self.segment_calllback_safe = None;
+    /// Installs `closure` as the segment callback `trampoline` calls, or clears it for `None`.
+    fn install_segment_callback(
+        &mut self,
+        closure: Option<Box<dyn FnMut(SegmentCallbackData) + Send>>,
+        trampoline: unsafe extern "C" fn(
+            *mut whisper_rs_sys::whisper_context,
+            *mut whisper_rs_sys::whisper_state,
+            c_int,
+            *mut std::ffi::c_void,
+        ),
+    ) {
+        match closure {
+            Some(closure) => {
+                let callback: Arc<SegmentCallbackFn> = Arc::new(Mutex::new(closure));
+                self.fp.new_segment_callback = Some(trampoline);
+                self.fp.new_segment_callback_user_data =
+                    Arc::as_ptr(&callback) as *mut std::ffi::c_void;
+                self.segment_calllback_safe = Some(callback);
             }
             None => {
-                self.segment_calllback_safe = None;
                 self.fp.new_segment_callback = None;
-                self.fp.new_segment_callback_user_data = std::ptr::null_mut::<c_void>();
+                self.fp.new_segment_callback_user_data = std::ptr::null_mut();
+                self.segment_calllback_safe = None;
             }
         }
     }
@@ -577,35 +543,38 @@ impl<'a, 'b> FullParams<'a, 'b> {
     /// See `set_progress_callback` if you need to use `whisper_context` and `whisper_state`
     /// (or extend this one to support their use).
     ///
+    /// The params own the closure, and clones of them share it, so it lives exactly as long as
+    /// the last params that can call it.
+    ///
     /// Defaults to None.
     pub fn set_progress_callback_safe<O, F>(&mut self, closure: O)
     where
-        F: FnMut(i32) + 'static,
+        F: FnMut(i32) + Send + 'static,
         O: Into<Option<F>>,
     {
         use std::ffi::c_void;
         use whisper_rs_sys::{whisper_context, whisper_state};
 
-        unsafe extern "C" fn trampoline<F>(
+        unsafe extern "C" fn trampoline(
             _: *mut whisper_context,
             _: *mut whisper_state,
             progress: c_int,
             user_data: *mut c_void,
-        ) where
-            F: FnMut(i32),
-        {
-            let user_data = &mut *(user_data as *mut F);
-            user_data(progress);
+        ) {
+            // SAFETY: `user_data` points at the `ProgressCallbackFn` that
+            // `progress_callback_safe` keeps alive for as long as these params, or a clone of
+            // them, can run.
+            let callback = unsafe { &*(user_data as *const ProgressCallbackFn) };
+            let mut callback = callback.lock().unwrap_or_else(PoisonError::into_inner);
+            callback(progress);
         }
 
         match closure.into() {
             Some(closure) => {
-                self.fp.progress_callback = Some(trampoline::<Box<dyn FnMut(i32)>>);
-                let boxed_closure = Box::new(closure) as Box<dyn FnMut(i32)>;
-                let boxed_closure = Box::new(boxed_closure);
-                let raw_ptr = Box::into_raw(boxed_closure);
-                self.fp.progress_callback_user_data = raw_ptr as *mut c_void;
-                self.progress_callback_safe = None;
+                let callback: Arc<ProgressCallbackFn> = Arc::new(Mutex::new(Box::new(closure)));
+                self.fp.progress_callback = Some(trampoline);
+                self.fp.progress_callback_user_data = Arc::as_ptr(&callback) as *mut c_void;
+                self.progress_callback_safe = Some(callback);
             }
             None => {
                 self.fp.progress_callback = None;
@@ -852,6 +821,49 @@ impl<'a, 'b> FullParams<'a, 'b> {
     }
 }
 
+/// Calls the segment closure behind `user_data` with each of the `n_new` segments `state` just
+/// decoded, passing text that is not valid UTF-8 lossily when `lossy` and skipping it otherwise.
+///
+/// # Safety
+///
+/// `state` is the state whisper.cpp called the segment callback with, and `user_data` points at
+/// a live `SegmentCallbackFn`.
+unsafe fn deliver_new_segments(
+    state: *mut whisper_rs_sys::whisper_state,
+    n_new: c_int,
+    user_data: *mut std::ffi::c_void,
+    lossy: bool,
+) {
+    // SAFETY: the caller guarantees `user_data` points at a live `SegmentCallbackFn`.
+    let callback = unsafe { &*(user_data as *const SegmentCallbackFn) };
+    let mut callback = callback.lock().unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: the caller guarantees `state` is the state whisper.cpp decodes on, whose segments
+    // stay valid for the duration of the callback.
+    unsafe {
+        let n_segments = whisper_rs_sys::whisper_full_n_segments_from_state(state);
+        // whisper.cpp never reports more new segments than it holds; a negative index would
+        // read outside them.
+        for i in n_segments.saturating_sub(n_new).max(0)..n_segments {
+            let text = whisper_rs_sys::whisper_full_get_segment_text_from_state(state, i);
+            let text = std::ffi::CStr::from_ptr(text);
+            let text = if lossy {
+                text.to_string_lossy().into_owned()
+            } else {
+                match text.to_str() {
+                    Ok(text) => text.to_owned(),
+                    Err(_) => continue,
+                }
+            };
+            callback(SegmentCallbackData {
+                segment: i,
+                start_timestamp: whisper_rs_sys::whisper_full_get_segment_t0_from_state(state, i),
+                end_timestamp: whisper_rs_sys::whisper_full_get_segment_t1_from_state(state, i),
+                text,
+            });
+        }
+    }
+}
+
 impl Debug for FullParams<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("FullParams")
@@ -963,7 +975,7 @@ mod test_whisper_params_initial_prompt {
 }
 
 #[cfg(test)]
-mod test_whisper_params_abort_callback {
+mod test_whisper_params_safe_callbacks {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1031,5 +1043,79 @@ mod test_whisper_params_abort_callback {
         assert_eq!(Arc::strong_count(&captured), 1);
         assert!(params.fp.abort_callback.is_none());
         assert!(params.fp.abort_callback_user_data.is_null());
+    }
+
+    /// Calls the progress callback the way whisper.cpp does, through the raw function and user
+    /// data.
+    fn call_progress_callback(params: &FullParams, progress: c_int) {
+        let callback = params
+            .fp
+            .progress_callback
+            .expect("a progress callback is installed");
+        unsafe {
+            callback(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                progress,
+                params.fp.progress_callback_user_data,
+            )
+        }
+    }
+
+    #[test]
+    fn test_progress_callback_reaches_the_closure_and_is_dropped_with_the_last_params() {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_progress_callback_safe({
+            let reported = Arc::clone(&reported);
+            move |progress| reported.lock().unwrap().push(progress)
+        });
+        let clone = params.clone();
+
+        call_progress_callback(&params, 10);
+        drop(params);
+        call_progress_callback(&clone, 20);
+        assert_eq!(*reported.lock().unwrap(), vec![10, 20]);
+        assert_eq!(
+            Arc::strong_count(&reported),
+            2,
+            "the clone still holds the closure"
+        );
+        drop(clone);
+        assert_eq!(Arc::strong_count(&reported), 1, "the closure was freed");
+    }
+
+    #[test]
+    fn test_segment_callbacks_are_owned_by_the_params() {
+        let captured = Arc::new(());
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_segment_callback_safe({
+            let captured = Arc::clone(&captured);
+            move |_segment| drop(Arc::clone(&captured))
+        });
+        assert!(params.fp.new_segment_callback.is_some());
+        let clone = params.clone();
+        drop(params);
+        assert_eq!(
+            Arc::strong_count(&captured),
+            2,
+            "the clone still holds the closure"
+        );
+
+        // Replacing the closure, here with the lossy variant, frees the one it replaces.
+        let mut params = clone;
+        params.set_segment_callback_safe_lossy({
+            let captured = Arc::clone(&captured);
+            move |_segment| drop(Arc::clone(&captured))
+        });
+        assert_eq!(
+            Arc::strong_count(&captured),
+            2,
+            "only the new closure holds it"
+        );
+        params.set_segment_callback_safe::<_, fn(SegmentCallbackData)>(None);
+        assert_eq!(Arc::strong_count(&captured), 1, "the closure was freed");
+        assert!(params.fp.new_segment_callback.is_none());
+        assert!(params.fp.new_segment_callback_user_data.is_null());
     }
 }
