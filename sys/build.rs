@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let target = env::var("TARGET").unwrap();
+    // When `system-ggml` is on, ggml-sys owns all ggml link directives, including the libraries
+    // its backends need — emit only the whisper-specific ones here. Doubling up would either
+    // fail at link time (duplicate symbols or libraries not on the search path) or, worse,
+    // link two ggmls into one binary.
+    let link_ggml = !cfg!(feature = "system-ggml");
     // Link C++ standard library
     if let Some(cpp_stdlib) = get_cpp_link_stdlib(&target) {
         println!("cargo:rustc-link-lib=dylib={}", cpp_stdlib);
@@ -35,7 +40,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=whisper.coreml");
 
     #[cfg(feature = "openblas")]
-    {
+    if link_ggml {
         if let Ok(openblas_path) = env::var("OPENBLAS_PATH") {
             println!(
                 "cargo::rustc-link-search={}",
@@ -49,7 +54,7 @@ fn main() {
         }
     }
     #[cfg(feature = "cuda")]
-    {
+    if link_ggml {
         println!("cargo:rustc-link-lib=cublas");
         println!("cargo:rustc-link-lib=cudart");
         println!("cargo:rustc-link-lib=cublasLt");
@@ -68,7 +73,7 @@ fn main() {
         }
     }
     #[cfg(feature = "hipblas")]
-    {
+    if link_ggml {
         println!("cargo:rustc-link-lib=hipblas");
         println!("cargo:rustc-link-lib=rocblas");
         println!("cargo:rustc-link-lib=amdhip64");
@@ -367,11 +372,6 @@ fn main() {
     add_link_search_path(&out.join("build")).unwrap();
 
     println!("cargo:rustc-link-search=native={}", destination.display());
-
-    // When `system-ggml` is on, ggml-sys owns all ggml link directives — emit
-    // only the whisper-specific ones here. Doubling up would either fail at
-    // link time (duplicate symbols) or, worse, link two ggmls into one binary.
-    let link_ggml = !cfg!(feature = "system-ggml");
 
     if cfg!(feature = "intel-sycl") {
         println!("cargo:rustc-link-lib=whisper");
